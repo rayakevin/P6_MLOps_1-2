@@ -8,3 +8,12 @@ wheels/
 
 # Virtual environments
 .venv/
+
+# Local raw datasets too large for GitHub
+data/raw/POS_CASH_balance.csv
+data/raw/application_train.csv
+data/raw/bureau.csv
+data/raw/bureau_balance.csv
+data/raw/credit_card_balance.csv
+data/raw/installments_payments.csv
+data/raw/previous_application.csv
