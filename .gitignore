@@ -17,3 +17,6 @@ data/raw/bureau_balance.csv
 data/raw/credit_card_balance.csv
 data/raw/installments_payments.csv
 data/raw/previous_application.csv
+
+# Generated processed datasets
+data/processed/

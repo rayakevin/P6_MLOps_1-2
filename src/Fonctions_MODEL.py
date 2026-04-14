@@ -39,6 +39,7 @@ def encode_cat_col(
     df: pd.DataFrame,
     col_name: str,
     encoding_type: str,
+    ordinal_categories: list | None = None,
 ) -> tuple[pd.DataFrame, object]:
     """
     Encode une seule variable catégorielle selon la méthode choisie.
@@ -109,10 +110,15 @@ def encode_cat_col(
         return df_encoded, encoder
 
     if encoding_type == "ordinal":
-        encoder = OrdinalEncoder(
-            handle_unknown="use_encoded_value",
-            unknown_value=-1,
-        )
+        encoder_kwargs = {
+            "handle_unknown": "use_encoded_value",
+            "unknown_value": -1,
+        }
+
+        if ordinal_categories is not None:
+            encoder_kwargs["categories"] = [ordinal_categories]
+
+        encoder = OrdinalEncoder(**encoder_kwargs)
 
         encoded_array = encoder.fit_transform(df_encoded[[col_name]])
         df_encoded[col_name] = encoded_array.astype(int)
