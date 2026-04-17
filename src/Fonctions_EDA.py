@@ -1,9 +1,25 @@
 ﻿#uv add numpy pandas scikit-learn matplotlib seaborn category-encoders scipy joblib tqdm
 
 # Fonctions.py
+from pathlib import Path
+import gc
+
 import numpy as np
 import pandas as pd
 from IPython.display import display
+from scipy.stats import chi2_contingency
+
+
+RAW_TABLES = {
+    "application_train": "application_train.csv",
+    "application_test": "application_test.csv",
+    "bureau": "bureau.csv",
+    "bureau_balance": "bureau_balance.csv",
+    "previous_application": "previous_application.csv",
+    "pos_cash_balance": "POS_CASH_balance.csv",
+    "installments_payments": "installments_payments.csv",
+    "credit_card_balance": "credit_card_balance.csv",
+}
 
 
 def eda_overview(df: pd.DataFrame) -> None:
@@ -150,551 +166,938 @@ def eda_overview(df: pd.DataFrame) -> None:
     else:
         print("\nAucune variable datetime.")
 
+# ---------------------------------------------------------------------------
+# Helpers génériques de qualité de données / encodage
+# ---------------------------------------------------------------------------
 
-def _quote_ident(identifier: str) -> str:
+def safe_divide(numerator, denominator):
     """
-    Quote un identifiant SQL PostgreSQL.
-
-    Cette fonction est utile pour manipuler sans erreur des noms de colonnes
-    provenant des CSV Home Credit, qui conservent leur casse d'origine
-    (ex. "TARGET", "AMT_CREDIT"). En PostgreSQL, ne pas quoter ces noms
-    reviendrait a les convertir en minuscules.
+    Réalise une division sûre en renvoyant `NaN` si le dénominateur vaut 0.
     """
-    return '"' + identifier.replace('"', '""') + '"'
+    numerator_arr = np.asarray(numerator, dtype=float)
+    denominator_arr = np.asarray(denominator, dtype=float)
+    result = np.full_like(numerator_arr, np.nan, dtype=float)
+    valid_mask = (~np.isnan(denominator_arr)) & (denominator_arr != 0)
+    result[valid_mask] = numerator_arr[valid_mask] / denominator_arr[valid_mask]
+    return result
 
 
-def _qualified_table_name(schema: str, table_name: str) -> str:
+def one_hot_encode_dataframe(
+    df: pd.DataFrame,
+    nan_as_category: bool = True,
+) -> tuple[pd.DataFrame, list[str]]:
     """
-    Construit un nom de table qualifie `schema.table` correctement quote.
-    """
-    return f"{_quote_ident(schema)}.{_quote_ident(table_name)}"
+    Encode toutes les colonnes catégorielles d'un DataFrame en one-hot.
 
-
-def _build_union_all(queries: list[str]) -> str:
+    La fonction renvoie le DataFrame encodé ainsi que la liste des colonnes
+    nouvellement créées.
     """
-    Assemble une liste de SELECT en un seul bloc SQL avec UNION ALL.
-
-    Cette approche permet de calculer un rapport colonne par colonne tout en
-    recuperant le resultat dans un seul DataFrame pandas.
-    """
-    wrapped_queries = [
-        f"SELECT * FROM (\n{query}\n) AS subquery_{idx}"
-        for idx, query in enumerate(queries, start=1)
+    original_columns = list(df.columns)
+    categorical_columns = [
+        column
+        for column in df.columns
+        if pd.api.types.is_object_dtype(df[column]) or pd.api.types.is_categorical_dtype(df[column])
     ]
-    return "\nUNION ALL\n".join(wrapped_queries)
 
+    if not categorical_columns:
+        return df.copy(), []
 
-def _get_table_columns(conn, table_name: str, schema: str) -> pd.DataFrame:
-    """
-    Récupère les colonnes et types d'une table PostgreSQL.
-    """
-    columns_query = f"""
-        SELECT
-            column_name,
-            data_type
-        FROM information_schema.columns
-        WHERE table_schema = '{schema}'
-          AND table_name = '{table_name}'
-        ORDER BY ordinal_position
-    """
-    return pd.read_sql(columns_query, conn)
-
-
-def _get_global_table_stats(conn, table_ref: str, column_names: list[str]) -> pd.DataFrame:
-    """
-    Calcule les statistiques globales de la table : lignes, colonnes, doublons.
-    """
-    n_cols = len(column_names)
-    row_expr = ", ".join(_quote_ident(col) for col in column_names)
-    global_query = f"""
-        SELECT
-            COUNT(*) AS n_lignes,
-            {n_cols} AS n_colonnes,
-            COUNT(*) - COUNT(DISTINCT ROW({row_expr})) AS doublons
-        FROM {table_ref}
-    """
-    global_df = pd.read_sql(global_query, conn)
-    global_df["%_doublons"] = np.where(
-        global_df["n_lignes"] > 0,
-        (global_df["doublons"] / global_df["n_lignes"] * 100).round(2),
-        0,
+    encoded_df = pd.get_dummies(
+        df,
+        columns=categorical_columns,
+        dummy_na=nan_as_category,
+        dtype=np.uint8,
     )
-    return global_df
+    new_columns = [column for column in encoded_df.columns if column not in original_columns]
+    return encoded_df, new_columns
 
 
-def eda_overview_sql(conn, table_name: str, schema: str = "public") -> None:
+def drop_low_information_columns(
+    df: pd.DataFrame,
+    protected_columns: list[str] | None = None,
+    missing_ratio_threshold: float = 0.995,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Affiche un aperçu EDA d'une table PostgreSQL.
+    Supprime les colonnes objectivement inutiles avant modélisation.
 
-    Le rapport suit la meme logique que `eda_overview`, mais les calculs sont
-    effectues directement en SQL sur la base :
-    1. Vue globale du dataset
-    2. Qualité des colonnes (types, manquants, cardinalité)
-    3. Variables numériques
-       3.1 Complétude (%NaN+%0, %NaN, %0)
-       3.2 Distribution générale (%outliers IQR, quartiles, skew, kurtosis)
-    4. Variables catégorielles
-    5. Variables temporelles
+    La fonction applique volontairement des règles prudentes :
+    - colonne entièrement vide ;
+    - colonne quasi entièrement vide ;
+    - colonne constante une fois les valeurs manquantes ignorées.
 
     Parameters
     ----------
-    conn :
-        Connexion DB-API ouverte vers PostgreSQL, compatible avec `pandas.read_sql`.
-    table_name : str
-        Nom de la table à analyser.
-    schema : str, default="public"
-        Schéma PostgreSQL contenant la table.
+    df : pd.DataFrame
+        Tableau à filtrer.
+    protected_columns : list[str] | None
+        Colonnes à ne jamais supprimer, même si elles respectent un critère.
+    missing_ratio_threshold : float
+        Seuil au-delà duquel une colonne est considérée comme trop vide.
 
     Returns
     -------
-    None
-        La fonction affiche les tableaux avec `display` et ne retourne rien.
-
-    Pourquoi passer par SQL
-    -----------------------
-    Pour les grosses tables, il est plus efficace de laisser PostgreSQL faire
-    les agrégations et de ne remonter dans pandas que les résultats résumés.
+    tuple[pd.DataFrame, pd.DataFrame]
+        Le DataFrame filtré et un rapport des colonnes supprimées.
     """
-    table_ref = _qualified_table_name(schema, table_name)
-    columns_df = _get_table_columns(conn, table_name, schema)
+    protected = set(protected_columns or [])
 
-    if columns_df.empty:
-        raise ValueError(f"La table {schema}.{table_name} est introuvable.")
+    rows: list[dict[str, float | str]] = []
+    columns_to_drop: list[str] = []
 
-    column_names = columns_df["column_name"].tolist()
+    for column in df.columns:
+        if column in protected:
+            continue
 
-    # 1) Vue globale : taille du dataset et estimation des doublons exacts.
-    print("\n## 1) Vue globale")
-    global_df = _get_global_table_stats(conn, table_ref, column_names)
-    display(global_df)
+        series = df[column]
+        missing_ratio = float(series.isna().mean())
+        nunique = int(series.nunique(dropna=True))
 
-    # 2) Rapport colonne : types, manquants, cardinalité.
-    print("\n## 2) Qualité des colonnes et cardinalité")
-    col_queries = []
-    for _, row in columns_df.iterrows():
-        col = row["column_name"]
-        quoted_col = _quote_ident(col)
-        col_queries.append(
-            f"""
-            SELECT
-                '{col}' AS column_name,
-                '{row["data_type"]}' AS dtype,
-                COUNT(*) FILTER (WHERE {quoted_col} IS NOT NULL) AS non_null,
-                COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null,
-                COUNT(DISTINCT {quoted_col}) AS n_uniques
-            FROM {table_ref}
-            """
-        )
+        if series.isna().all():
+            rows.append(
+                {
+                    "feature": column,
+                    "reason": "all_missing",
+                    "missing_ratio": missing_ratio,
+                    "nunique": nunique,
+                }
+            )
+            columns_to_drop.append(column)
+        elif missing_ratio >= missing_ratio_threshold:
+            rows.append(
+                {
+                    "feature": column,
+                    "reason": "quasi_all_missing",
+                    "missing_ratio": missing_ratio,
+                    "nunique": nunique,
+                }
+            )
+            columns_to_drop.append(column)
+        elif nunique <= 1:
+            rows.append(
+                {
+                    "feature": column,
+                    "reason": "constant",
+                    "missing_ratio": missing_ratio,
+                    "nunique": nunique,
+                }
+            )
+            columns_to_drop.append(column)
 
-    col_report = pd.read_sql(_build_union_all(col_queries), conn)
-    n_rows = int(global_df.loc[0, "n_lignes"])
-    col_report["%null"] = np.where(
-        n_rows > 0,
-        (col_report["null"] / n_rows * 100).round(2),
-        0,
+    filtered_df = df.drop(columns=columns_to_drop, errors="ignore")
+    report = pd.DataFrame(rows)
+    if not report.empty:
+        report = report.sort_values(["reason", "missing_ratio", "feature"]).reset_index(drop=True)
+    return filtered_df, report
+
+
+# Alias plus court conservé pour compatibilité.
+one_hot_encoder = one_hot_encode_dataframe
+
+
+def missing_values_table(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Construit un tableau synthétique des valeurs manquantes.
+    """
+    report = pd.DataFrame(
+        {
+            "missing_count": df.isna().sum(),
+            "missing_ratio": df.isna().mean(),
+            "dtype": df.dtypes.astype(str),
+            "nunique": df.nunique(dropna=True),
+        }
     )
-    col_report = col_report[["column_name", "dtype", "%null", "non_null", "null", "n_uniques"]]
-    col_report = col_report.sort_values(["dtype", "%null"], ascending=[True, False])
-    display(col_report.set_index("column_name"))
-
-    numeric_types = {
-        "smallint",
-        "integer",
-        "bigint",
-        "numeric",
-        "real",
-        "double precision",
-        "smallserial",
-        "serial",
-        "bigserial",
-    }
-    categorical_types = {
-        "character varying",
-        "character",
-        "text",
-        "boolean",
-    }
-    datetime_types = {
-        "date",
-        "timestamp without time zone",
-        "timestamp with time zone",
-        "time without time zone",
-        "time with time zone",
-    }
-
-    numeric_cols = columns_df.loc[columns_df["data_type"].isin(numeric_types), "column_name"].tolist()
-    cat_cols = columns_df.loc[columns_df["data_type"].isin(categorical_types), "column_name"].tolist()
-    dt_cols = columns_df.loc[columns_df["data_type"].isin(datetime_types), "column_name"].tolist()
-
-    # 3) Variables numeriques.
-    print(f"\n## 3) Variables numériques ({len(numeric_cols)})")
-    if numeric_cols:
-        completion_queries = []
-        for col in numeric_cols:
-            quoted_col = _quote_ident(col)
-            completion_queries.append(
-                f"""
-                SELECT
-                    '{col}' AS column_name,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null_count,
-                    COUNT(*) FILTER (WHERE {quoted_col} = 0) AS zero_count
-                FROM {table_ref}
-                """
-            )
-
-        completion_report = pd.read_sql(_build_union_all(completion_queries), conn)
-        completion_report["%NaN"] = np.where(
-            n_rows > 0,
-            (completion_report["null_count"] / n_rows * 100).round(2),
-            0,
-        )
-        completion_report["%0"] = np.where(
-            n_rows > 0,
-            (completion_report["zero_count"] / n_rows * 100).round(2),
-            0,
-        )
-        completion_report["%NaN+%0"] = (
-            completion_report["%NaN"] + completion_report["%0"]
-        ).round(2)
-        completion_report = completion_report[
-            ["column_name", "%NaN+%0", "%NaN", "%0"]
-        ].sort_values("%NaN+%0", ascending=False)
-
-        print("\n### 3.1) Complétude variables numériques")
-        display(completion_report.set_index("column_name"))
-
-        distribution_queries = []
-        for col in numeric_cols:
-            quoted_col = _quote_ident(col)
-            distribution_queries.append(
-                f"""
-                WITH stats AS (
-                    SELECT
-                        COUNT({quoted_col}) AS non_null_count,
-                        MIN({quoted_col}) AS min_value,
-                        PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY {quoted_col}) AS q1,
-                        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {quoted_col}) AS median,
-                        PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY {quoted_col}) AS q3,
-                        MAX({quoted_col}) AS max_value,
-                        AVG({quoted_col}) AS mean_value,
-                        STDDEV_SAMP({quoted_col}) AS stddev_value
-                    FROM {table_ref}
-                    WHERE {quoted_col} IS NOT NULL
-                ),
-                outliers AS (
-                    SELECT
-                        COUNT(*) FILTER (WHERE t.{quoted_col} < s.q1 - 1.5 * (s.q3 - s.q1)) AS nb_outliers_bas,
-                        COUNT(*) FILTER (WHERE t.{quoted_col} > s.q3 + 1.5 * (s.q3 - s.q1)) AS nb_outliers_haut
-                    FROM {table_ref} t
-                    CROSS JOIN stats s
-                    WHERE t.{quoted_col} IS NOT NULL
-                ),
-                moments AS (
-                    SELECT
-                        AVG(
-                            CASE
-                                WHEN s.stddev_value IS NULL OR s.stddev_value = 0 THEN NULL
-                                ELSE POWER((t.{quoted_col} - s.mean_value) / s.stddev_value, 3)
-                            END
-                        ) AS skew_value,
-                        AVG(
-                            CASE
-                                WHEN s.stddev_value IS NULL OR s.stddev_value = 0 THEN NULL
-                                ELSE POWER((t.{quoted_col} - s.mean_value) / s.stddev_value, 4)
-                            END
-                        ) - 3 AS kurtosis_value
-                    FROM {table_ref} t
-                    CROSS JOIN stats s
-                    WHERE t.{quoted_col} IS NOT NULL
-                )
-                SELECT
-                    '{col}' AS column_name,
-                    ROUND(
-                        100.0 * (o.nb_outliers_bas + o.nb_outliers_haut)
-                        / NULLIF(s.non_null_count, 0), 2
-                    ) AS "%outliers (IQR)",
-                    o.nb_outliers_bas,
-                    o.nb_outliers_haut,
-                    s.min_value AS min,
-                    s.q1 AS "Q1",
-                    s.median AS median,
-                    s.q3 AS "Q3",
-                    s.max_value AS max,
-                    m.skew_value AS skew,
-                    m.kurtosis_value AS kurtosis
-                FROM stats s
-                CROSS JOIN outliers o
-                CROSS JOIN moments m
-                """
-            )
-
-        distribution_report = pd.read_sql(_build_union_all(distribution_queries), conn)
-        distribution_report = distribution_report.sort_values("%outliers (IQR)", ascending=False)
-
-        print("\n### 3.2) Distribution générale variables numériques")
-        display(distribution_report.set_index("column_name"))
-    else:
-        print("\nAucune variable numérique.")
-
-    # 4) Variables categorielles.
-    print(f"\n## 4) Variables catégorielles ({len(cat_cols)})")
-    if cat_cols:
-        cat_queries = []
-        for col in cat_cols:
-            quoted_col = _quote_ident(col)
-            cat_queries.append(
-                f"""
-                WITH top_modality AS (
-                    SELECT
-                        {quoted_col} AS modalite_top,
-                        COUNT(*) AS nb_modalite_top
-                    FROM {table_ref}
-                    WHERE {quoted_col} IS NOT NULL
-                    GROUP BY {quoted_col}
-                    ORDER BY COUNT(*) DESC, {quoted_col}
-                    LIMIT 1
-                )
-                SELECT
-                    '{col}' AS column_name,
-                    COUNT(DISTINCT {quoted_col}) AS n_uniques,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null,
-                    (SELECT modalite_top FROM top_modality) AS modalite_top,
-                    COALESCE((SELECT nb_modalite_top FROM top_modality), 0) AS nb_modalite_top
-                FROM {table_ref}
-                """
-            )
-
-        cat_summary = pd.read_sql(_build_union_all(cat_queries), conn)
-        cat_summary["%null"] = np.where(
-            n_rows > 0,
-            (cat_summary["null"] / n_rows * 100).round(2),
-            0,
-        )
-        cat_summary = cat_summary[
-            ["column_name", "n_uniques", "null", "%null", "modalite_top", "nb_modalite_top"]
-        ].sort_values(["%null", "n_uniques"], ascending=[False, False])
-        display(cat_summary.set_index("column_name"))
-    else:
-        print("\nAucune variable catégorielle.")
-
-    # 5) Variables temporelles.
-    print(f"\n## 5) Variables temporelles ({len(dt_cols)})")
-    if dt_cols:
-        dt_queries = []
-        for col in dt_cols:
-            quoted_col = _quote_ident(col)
-            dt_queries.append(
-                f"""
-                SELECT
-                    '{col}' AS column_name,
-                    MIN({quoted_col}) AS min,
-                    MAX({quoted_col}) AS max,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null
-                FROM {table_ref}
-                """
-            )
-
-        dt_summary = pd.read_sql(_build_union_all(dt_queries), conn)
-        dt_summary["%null"] = np.where(
-            n_rows > 0,
-            (dt_summary["null"] / n_rows * 100).round(2),
-            0,
-        )
-        display(dt_summary.set_index("column_name"))
-    else:
-        print("\nAucune variable datetime.")
+    return report.loc[report["missing_count"] > 0].sort_values(
+        ["missing_ratio", "missing_count"],
+        ascending=False,
+    )
 
 
-def eda_overview_sql_light(conn, table_name: str, schema: str = "public") -> None:
+def duplicate_report(df: pd.DataFrame, key: str) -> dict[str, int | float]:
     """
-    Affiche une version légère de l'EDA d'une table PostgreSQL.
+    Résume le niveau de duplication observé sur une clé métier.
+    """
+    duplicated_count = int(df.duplicated(subset=[key]).sum())
+    total_rows = int(len(df))
+    return {
+        "rows": total_rows,
+        "unique_keys": int(df[key].nunique(dropna=False)),
+        "duplicated_keys": duplicated_count,
+        "duplicated_ratio": round(duplicated_count / total_rows, 4) if total_rows else 0.0,
+    }
 
-    Cette version vise l'itération rapide. Elle conserve les éléments les plus
-    utiles pour une première exploration, mais évite les calculs coûteux comme :
-    - quartiles,
-    - détection d'outliers IQR,
-    - skew,
-    - kurtosis.
+
+def cramers_v_corrected(x: pd.Series, y: pd.Series) -> float:
+    """
+    Calcule un V de Cramer corrigé entre une variable catégorielle et une cible.
+    """
+    confusion = pd.crosstab(x.fillna("__MISSING__"), y)
+    if confusion.shape[0] < 2 or confusion.shape[1] < 2:
+        return np.nan
+
+    chi2 = chi2_contingency(confusion)[0]
+    n = confusion.to_numpy().sum()
+    if n <= 1:
+        return np.nan
+
+    phi2 = chi2 / n
+    r, k = confusion.shape
+    phi2corr = max(0.0, phi2 - ((k - 1) * (r - 1)) / (n - 1))
+    rcorr = r - ((r - 1) ** 2) / (n - 1)
+    kcorr = k - ((k - 1) ** 2) / (n - 1)
+    denom = min(kcorr - 1, rcorr - 1)
+    if denom <= 0:
+        return np.nan
+    return float(np.sqrt(phi2corr / denom))
+
+
+def summarize_categorical_association(
+    df: pd.DataFrame,
+    columns: list[str],
+    target_col: str,
+) -> pd.DataFrame:
+    """
+    Résume l'association entre plusieurs variables catégorielles et une cible.
+
+    Pour chaque variable, la fonction construit une table de contingence avec la
+    cible, calcule le test du chi-2 et le V de Cramer corrigé, puis renvoie un
+    tableau trié des variables les plus associées à la cible.
+    """
+    rows = []
+
+    for col in columns:
+        tmp = df[[col, target_col]].copy()
+        tmp[col] = tmp[col].astype("string").fillna("__MISSING__")
+        contingency = pd.crosstab(tmp[col], tmp[target_col])
+
+        if contingency.shape[0] < 2 or contingency.shape[1] < 2:
+            continue
+
+        chi2, p_value, _, _ = chi2_contingency(contingency)
+        rows.append(
+            {
+                "variable": col,
+                "chi2": float(chi2),
+                "p_value": float(p_value),
+                "nb_modalites": int(contingency.shape[0]),
+                "cramers_v": cramers_v_corrected(tmp[col], tmp[target_col]),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["variable", "chi2", "p_value", "nb_modalites", "cramers_v"]
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["cramers_v", "chi2"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+
+
+def summarize_binary_flags(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    """
+    Compare le taux de cible des variables binaires au taux global.
+    """
+    global_rate = df[target_col].mean()
+    flag_cols = [
+        col
+        for col in df.columns
+        if col != target_col and df[col].dropna().nunique() == 2
+    ]
+
+    rows = []
+    for col in flag_cols:
+        tmp = df[[col, target_col]].copy()
+        tmp[col] = tmp[col].astype("string").fillna("__MISSING__")
+
+        stats = (
+            tmp.groupby(col, dropna=False)[target_col]
+            .agg(nb_obs="size", nb_target_1="sum", taux_target_1="mean")
+            .reset_index()
+            .rename(columns={col: "modalite"})
+        )
+        stats["part_obs"] = stats["nb_obs"] / len(tmp)
+        stats["ecart_vs_taux_global"] = stats["taux_target_1"] - global_rate
+        stats["ratio_vs_taux_global"] = np.where(
+            global_rate > 0,
+            stats["taux_target_1"] / global_rate,
+            np.nan,
+        )
+        stats["variable"] = col
+        rows.append(stats)
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.concat(rows, ignore_index=True)
+    result["ecart_abs"] = result["ecart_vs_taux_global"].abs()
+    return result[
+        [
+            "variable",
+            "modalite",
+            "nb_obs",
+            "part_obs",
+            "nb_target_1",
+            "taux_target_1",
+            "ecart_vs_taux_global",
+            "ratio_vs_taux_global",
+            "ecart_abs",
+        ]
+    ].sort_values(["ecart_abs", "nb_obs"], ascending=[False, False])
+
+
+def summarize_categorical_modalities(
+    df: pd.DataFrame,
+    columns: list[str],
+    target_col: str,
+) -> pd.DataFrame:
+    """
+    Résume les modalités catégorielles les plus associées à la cible.
+    """
+    global_rate = df[target_col].mean()
+    rows = []
+
+    for col in columns:
+        tmp = df[[col, target_col]].copy()
+        tmp[col] = tmp[col].astype("string").fillna("__MISSING__")
+        stats = (
+            tmp.groupby(col, dropna=False)[target_col]
+            .agg(nb_obs="size", nb_target_1="sum", taux_target_1="mean")
+            .reset_index()
+            .rename(columns={col: "modalite"})
+        )
+        stats["part_obs"] = stats["nb_obs"] / len(tmp)
+        stats["ecart_vs_taux_global"] = stats["taux_target_1"] - global_rate
+        stats["ratio_vs_taux_global"] = np.where(
+            global_rate > 0,
+            stats["taux_target_1"] / global_rate,
+            np.nan,
+        )
+        stats["variable"] = col
+        rows.append(stats)
+
+    if not rows:
+        return pd.DataFrame()
+
+    result = pd.concat(rows, ignore_index=True)
+    result["ecart_abs"] = result["ecart_vs_taux_global"].abs()
+    return result[
+        [
+            "variable",
+            "modalite",
+            "nb_obs",
+            "part_obs",
+            "nb_target_1",
+            "taux_target_1",
+            "ecart_vs_taux_global",
+            "ratio_vs_taux_global",
+            "ecart_abs",
+        ]
+    ].sort_values(["ecart_abs", "nb_obs"], ascending=[False, False])
+
+
+# ---------------------------------------------------------------------------
+# Helpers projet : agrégation multi-tables Home Credit
+# ---------------------------------------------------------------------------
+
+def _read_csv_from_directory(
+    data_dir: Path | str,
+    file_name: str,
+    num_rows: int | None = None,
+) -> pd.DataFrame:
+    """
+    Charge un fichier CSV situé dans un répertoire de données.
 
     Parameters
     ----------
-    conn :
-        Connexion DB-API ouverte vers PostgreSQL.
-    table_name : str
-        Nom de la table à analyser.
-    schema : str, default="public"
-        Schéma PostgreSQL contenant la table.
+    data_dir : Path | str
+        Répertoire contenant les tables brutes.
+    file_name : str
+        Nom du fichier CSV à lire.
+    num_rows : int | None, optional
+        Nombre maximum de lignes à charger. Si None, charge tout le fichier.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame contenant les données lues depuis le CSV.
+
+    Notes
+    -----
+    Cette fonction sert de petit helper pour centraliser la logique de lecture
+    des tables brutes du projet.
     """
-    table_ref = _qualified_table_name(schema, table_name)
-    columns_df = _get_table_columns(conn, table_name, schema)
+    data_path = Path(data_dir) / file_name
+    return pd.read_csv(data_path, nrows=num_rows)
 
-    if columns_df.empty:
-        raise ValueError(f"La table {schema}.{table_name} est introuvable.")
 
-    column_names = columns_df["column_name"].tolist()
-    global_df = _get_global_table_stats(conn, table_ref, column_names)
-    n_rows = int(global_df.loc[0, "n_lignes"])
+def application_train_test(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = False,
+) -> pd.DataFrame:
+    """
+    Prépare et fusionne les tables `application_train` et `application_test`.
 
-    numeric_types = {
-        "smallint",
-        "integer",
-        "bigint",
-        "numeric",
-        "real",
-        "double precision",
-        "smallserial",
-        "serial",
-        "bigserial",
-    }
-    categorical_types = {
-        "character varying",
-        "character",
-        "text",
-        "boolean",
-    }
-    datetime_types = {
-        "date",
-        "timestamp without time zone",
-        "timestamp with time zone",
-        "time without time zone",
-        "time with time zone",
-    }
+    Cette fonction :
+    - charge les deux tables principales,
+    - applique un prétraitement identique aux deux jeux,
+    - aligne les colonnes après encodage,
+    - concatène train et test dans un unique DataFrame,
+    - supprime les colonnes jugées peu informatives.
 
-    numeric_cols = columns_df.loc[columns_df["data_type"].isin(numeric_types), "column_name"].tolist()
-    cat_cols = columns_df.loc[columns_df["data_type"].isin(categorical_types), "column_name"].tolist()
-    dt_cols = columns_df.loc[columns_df["data_type"].isin(datetime_types), "column_name"].tolist()
+    Parameters
+    ----------
+    data_dir : Path | str
+        Répertoire contenant les fichiers bruts.
+    num_rows : int | None, optional
+        Nombre maximum de lignes à charger par table.
+    nan_as_category : bool, optional
+        Si True, les valeurs manquantes sont traitées comme une catégorie
+        lors du one-hot encoding.
 
-    print("\n## 1) Vue globale")
-    display(global_df)
+    Returns
+    -------
+    pd.DataFrame
+        Table principale combinée train + test.
+    """
+    # Lecture des tables principales
+    train_df = _read_csv_from_directory(data_dir, RAW_TABLES["application_train"], num_rows=num_rows)
+    test_df = _read_csv_from_directory(data_dir, RAW_TABLES["application_test"], num_rows=num_rows)
 
-    print("\n## 2) Qualité des colonnes et cardinalité")
-    col_queries = []
-    for _, row in columns_df.iterrows():
-        col = row["column_name"]
-        quoted_col = _quote_ident(col)
-        col_queries.append(
-            f"""
-            SELECT
-                '{col}' AS column_name,
-                '{row["data_type"]}' AS dtype,
-                COUNT(*) FILTER (WHERE {quoted_col} IS NOT NULL) AS non_null,
-                COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null,
-                COUNT(DISTINCT {quoted_col}) AS n_uniques
-            FROM {table_ref}
-            """
-        )
+    def preprocess_application_table(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Applique le prétraitement métier à une table application.
 
-    col_report = pd.read_sql(_build_union_all(col_queries), conn)
-    col_report["%null"] = np.where(
-        n_rows > 0,
-        (col_report["null"] / n_rows * 100).round(2),
-        0,
+        Étapes principales :
+        - suppression des lignes avec genre anormal ("XNA"),
+        - mapping binaire de certaines colonnes catégorielles,
+        - gestion de l'anomalie DAYS_EMPLOYED = 365243,
+        - création de statistiques sur les colonnes EXT_SOURCE,
+        - création de ratios métier,
+        - encodage one-hot des variables catégorielles.
+        """
+        # On exclut la modalité anormale CODE_GENDER = XNA
+        output = df.loc[df["CODE_GENDER"] != "XNA"].copy()
+
+        # Transformation de variables binaires textuelles en 0/1
+        binary_mappings = {
+            "CODE_GENDER": {"F": 0, "M": 1},
+            "FLAG_OWN_CAR": {"N": 0, "Y": 1},
+            "FLAG_OWN_REALTY": {"N": 0, "Y": 1},
+        }
+        for column, mapping in binary_mappings.items():
+            output[column] = output[column].map(mapping)
+
+        # DAYS_EMPLOYED = 365243 est une valeur sentinelle/anormale dans Home Credit
+        # On crée un indicateur de cette anomalie, puis on remplace la valeur par NaN
+        output["DAYS_EMPLOYED_ANOM"] = (output["DAYS_EMPLOYED"] == 365243).astype(int)
+        output["DAYS_EMPLOYED"] = output["DAYS_EMPLOYED"].replace(365243, np.nan)
+
+        # Construction de features synthétiques à partir des sources externes
+        ext_sources = ["EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"]
+        output["EXT_SOURCES_MEAN"] = output[ext_sources].mean(axis=1)
+        output["EXT_SOURCES_STD"] = output[ext_sources].std(axis=1)
+
+        # Si l'écart-type n'est pas calculable (ex. trop de NaN), on remplace par la médiane
+        output["EXT_SOURCES_STD"] = output["EXT_SOURCES_STD"].fillna(output["EXT_SOURCES_STD"].median())
+
+        # Création de ratios métier
+        # safe_divide évite les divisions par zéro / valeurs invalides
+        output["CREDIT_TO_ANNUITY_RATIO"] = safe_divide(output["AMT_CREDIT"], output["AMT_ANNUITY"])
+        output["CREDIT_TO_GOODS_RATIO"] = safe_divide(output["AMT_CREDIT"], output["AMT_GOODS_PRICE"])
+        output["ANNUITY_TO_INCOME_RATIO"] = safe_divide(output["AMT_ANNUITY"], output["AMT_INCOME_TOTAL"])
+        output["CREDIT_TO_INCOME_RATIO"] = safe_divide(output["AMT_CREDIT"], output["AMT_INCOME_TOTAL"])
+        output["INCOME_PER_PERSON"] = safe_divide(output["AMT_INCOME_TOTAL"], output["CNT_FAM_MEMBERS"])
+        output["DAYS_EMPLOYED_PERC"] = safe_divide(output["DAYS_EMPLOYED"], output["DAYS_BIRTH"])
+        output["PAYMENT_RATE"] = safe_divide(output["AMT_ANNUITY"], output["AMT_CREDIT"])
+        output["PHONE_CHANGE_TO_BIRTH_RATIO"] = safe_divide(output["DAYS_LAST_PHONE_CHANGE"], output["DAYS_BIRTH"])
+        output["ID_PUBLISH_TO_BIRTH_RATIO"] = safe_divide(output["DAYS_ID_PUBLISH"], output["DAYS_BIRTH"])
+
+        # One-hot encoding des colonnes catégorielles restantes
+        output, _ = one_hot_encode_dataframe(output, nan_as_category=nan_as_category)
+        return output
+
+    # Prétraitement identique sur train et test
+    train_df = preprocess_application_table(train_df)
+    test_df = preprocess_application_table(test_df)
+
+    # Alignement des colonnes pour garantir la même structure train/test
+    train_df, test_df = train_df.align(test_df, join="outer", axis=1)
+
+    # Concaténation verticale des deux jeux
+    combined = pd.concat([train_df, test_df], axis=0, ignore_index=True, sort=False)
+
+    # Suppression des colonnes peu informatives, sauf colonnes protégées
+    combined, _ = drop_low_information_columns(
+        combined,
+        protected_columns=["SK_ID_CURR", "TARGET"],
     )
-    col_report = col_report[["column_name", "dtype", "%null", "non_null", "null", "n_uniques"]]
-    col_report = col_report.sort_values(["dtype", "%null"], ascending=[True, False])
-    display(col_report.set_index("column_name"))
+    return combined
 
-    print(f"\n## 3) Variables numériques ({len(numeric_cols)})")
-    if numeric_cols:
-        numeric_queries = []
-        for col in numeric_cols:
-            quoted_col = _quote_ident(col)
-            numeric_queries.append(
-                f"""
-                SELECT
-                    '{col}' AS column_name,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null_count,
-                    COUNT(*) FILTER (WHERE {quoted_col} = 0) AS zero_count,
-                    MIN({quoted_col}) AS min,
-                    AVG({quoted_col}) AS mean,
-                    MAX({quoted_col}) AS max
-                FROM {table_ref}
-                """
-            )
 
-        numeric_report = pd.read_sql(_build_union_all(numeric_queries), conn)
-        numeric_report["%NaN"] = np.where(
-            n_rows > 0,
-            (numeric_report["null_count"] / n_rows * 100).round(2),
-            0,
+def bureau_and_balance(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrège les tables `bureau` et `bureau_balance` à la maille client (`SK_ID_CURR`).
+
+    Logique :
+    1. encoder les variables catégorielles,
+    2. agréger `bureau_balance` au niveau `SK_ID_BUREAU`,
+    3. rattacher cette agrégation à `bureau`,
+    4. agréger ensuite `bureau` au niveau client,
+    5. produire aussi des sous-agrégations sur crédits actifs et clôturés.
+
+    Returns
+    -------
+    pd.DataFrame
+        Features agrégées par client issues de l'historique bureau.
+    """
+    bureau = _read_csv_from_directory(data_dir, RAW_TABLES["bureau"], num_rows=num_rows)
+    bureau_balance = _read_csv_from_directory(data_dir, RAW_TABLES["bureau_balance"], num_rows=num_rows)
+
+    # One-hot encoding des catégories
+    bureau_balance, bureau_balance_cat = one_hot_encode_dataframe(
+        bureau_balance,
+        nan_as_category=nan_as_category,
+    )
+    bureau, bureau_cat = one_hot_encode_dataframe(bureau, nan_as_category=nan_as_category)
+
+    # Agrégation de bureau_balance à la maille du crédit bureau
+    bureau_balance_agg = {"MONTHS_BALANCE": ["min", "max", "size"]}
+    for column in bureau_balance_cat:
+        bureau_balance_agg[column] = ["mean"]
+
+    bureau_balance_grouped = bureau_balance.groupby("SK_ID_BUREAU").agg(bureau_balance_agg)
+    bureau_balance_grouped.columns = pd.Index(
+        [f"{column}_{agg.upper()}" for column, agg in bureau_balance_grouped.columns.tolist()]
+    )
+
+    # Jointure du résumé bureau_balance vers bureau
+    bureau = bureau.join(bureau_balance_grouped, how="left", on="SK_ID_BUREAU")
+
+    # Après jointure, SK_ID_BUREAU ne sert plus pour l'agrégation client finale
+    bureau = bureau.drop(columns=["SK_ID_BUREAU"])
+
+    # Agrégations numériques sur les crédits bureau
+    num_aggregations = {
+        "DAYS_CREDIT": ["min", "max", "mean", "var"],
+        "DAYS_CREDIT_ENDDATE": ["min", "max", "mean"],
+        "DAYS_CREDIT_UPDATE": ["mean"],
+        "CREDIT_DAY_OVERDUE": ["max", "mean"],
+        "AMT_CREDIT_MAX_OVERDUE": ["mean"],
+        "AMT_CREDIT_SUM": ["max", "mean", "sum"],
+        "AMT_CREDIT_SUM_DEBT": ["max", "mean", "sum"],
+        "AMT_CREDIT_SUM_OVERDUE": ["mean"],
+        "AMT_CREDIT_SUM_LIMIT": ["mean", "sum"],
+        "AMT_ANNUITY": ["max", "mean"],
+        "CNT_CREDIT_PROLONG": ["sum"],
+        "MONTHS_BALANCE_MIN": ["min"],
+        "MONTHS_BALANCE_MAX": ["max"],
+        "MONTHS_BALANCE_SIZE": ["mean", "sum"],
+    }
+
+    # Pour les variables catégorielles one-hot encodées, la moyenne = fréquence de la modalité
+    cat_aggregations = {column: ["mean"] for column in bureau_cat}
+    for column in bureau_balance_cat:
+        cat_aggregations[f"{column}_MEAN"] = ["mean"]
+
+    # Agrégation finale au niveau client
+    bureau_agg = bureau.groupby("SK_ID_CURR").agg({**num_aggregations, **cat_aggregations})
+    bureau_agg.columns = pd.Index(
+        [f"BURO_{column}_{agg.upper()}" for column, agg in bureau_agg.columns.tolist()]
+    )
+
+    # Nombre total de lignes bureau par client
+    bureau_agg = bureau_agg.join(bureau.groupby("SK_ID_CURR").size().rename("BURO_COUNT"))
+
+    # Sous-ensemble des crédits actifs
+    active = bureau.loc[bureau.get("CREDIT_ACTIVE_Active", 0) == 1]
+    if not active.empty:
+        active_agg = active.groupby("SK_ID_CURR").agg(num_aggregations)
+        active_agg.columns = pd.Index(
+            [f"ACTIVE_{column}_{agg.upper()}" for column, agg in active_agg.columns.tolist()]
         )
-        numeric_report["%0"] = np.where(
-            n_rows > 0,
-            (numeric_report["zero_count"] / n_rows * 100).round(2),
-            0,
+        bureau_agg = bureau_agg.join(active_agg, how="left", on="SK_ID_CURR")
+        bureau_agg = bureau_agg.join(active.groupby("SK_ID_CURR").size().rename("ACTIVE_COUNT"))
+
+    # Sous-ensemble des crédits clôturés
+    closed = bureau.loc[bureau.get("CREDIT_ACTIVE_Closed", 0) == 1]
+    if not closed.empty:
+        closed_agg = closed.groupby("SK_ID_CURR").agg(num_aggregations)
+        closed_agg.columns = pd.Index(
+            [f"CLOSED_{column}_{agg.upper()}" for column, agg in closed_agg.columns.tolist()]
         )
-        numeric_report["%NaN+%0"] = (
-            numeric_report["%NaN"] + numeric_report["%0"]
-        ).round(2)
-        numeric_report = numeric_report[
-            ["column_name", "%NaN+%0", "%NaN", "%0", "min", "mean", "max"]
-        ].sort_values("%NaN+%0", ascending=False)
-        display(numeric_report.set_index("column_name"))
-    else:
-        print("\nAucune variable numérique.")
+        bureau_agg = bureau_agg.join(closed_agg, how="left", on="SK_ID_CURR")
+        bureau_agg = bureau_agg.join(closed.groupby("SK_ID_CURR").size().rename("CLOSED_COUNT"))
 
-    print(f"\n## 4) Variables catégorielles ({len(cat_cols)})")
-    if cat_cols:
-        cat_queries = []
-        for col in cat_cols:
-            quoted_col = _quote_ident(col)
-            cat_queries.append(
-                f"""
-                WITH top_modality AS (
-                    SELECT
-                        {quoted_col} AS modalite_top,
-                        COUNT(*) AS nb_modalite_top
-                    FROM {table_ref}
-                    WHERE {quoted_col} IS NOT NULL
-                    GROUP BY {quoted_col}
-                    ORDER BY COUNT(*) DESC, {quoted_col}
-                    LIMIT 1
-                )
-                SELECT
-                    '{col}' AS column_name,
-                    COUNT(DISTINCT {quoted_col}) AS n_uniques,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null,
-                    (SELECT modalite_top FROM top_modality) AS modalite_top,
-                    COALESCE((SELECT nb_modalite_top FROM top_modality), 0) AS nb_modalite_top
-                FROM {table_ref}
-                """
-            )
+    # Libération mémoire
+    del bureau, bureau_balance, bureau_balance_grouped, active, closed
+    gc.collect()
+    return bureau_agg
 
-        cat_summary = pd.read_sql(_build_union_all(cat_queries), conn)
-        cat_summary["%null"] = np.where(
-            n_rows > 0,
-            (cat_summary["null"] / n_rows * 100).round(2),
-            0,
+
+def previous_applications(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrège la table `previous_application` à la maille client.
+
+    Cette fonction résume l'historique des demandes précédentes :
+    - montants,
+    - décisions,
+    - caractéristiques temporelles,
+    - statut approuvé/refusé.
+
+    Returns
+    -------
+    pd.DataFrame
+        Table agrégée au niveau `SK_ID_CURR`.
+    """
+    prev = _read_csv_from_directory(data_dir, RAW_TABLES["previous_application"], num_rows=num_rows)
+    prev, cat_cols = one_hot_encode_dataframe(prev, nan_as_category=nan_as_category)
+
+    # Remplacement des dates sentinelles par NaN
+    for column in [
+        "DAYS_FIRST_DRAWING",
+        "DAYS_FIRST_DUE",
+        "DAYS_LAST_DUE_1ST_VERSION",
+        "DAYS_LAST_DUE",
+        "DAYS_TERMINATION",
+    ]:
+        prev[column] = prev[column].replace(365243, np.nan)
+
+    # Ratio entre montant demandé et montant accordé
+    prev["APP_CREDIT_PERC"] = safe_divide(prev["AMT_APPLICATION"], prev["AMT_CREDIT"])
+
+    num_aggregations = {
+        "SK_ID_PREV": ["nunique"],
+        "AMT_ANNUITY": ["min", "max", "mean"],
+        "AMT_APPLICATION": ["min", "max", "mean"],
+        "AMT_CREDIT": ["min", "max", "mean"],
+        "APP_CREDIT_PERC": ["min", "max", "mean", "var"],
+        "AMT_DOWN_PAYMENT": ["min", "max", "mean"],
+        "AMT_GOODS_PRICE": ["min", "max", "mean"],
+        "HOUR_APPR_PROCESS_START": ["min", "max", "mean"],
+        "RATE_DOWN_PAYMENT": ["min", "max", "mean"],
+        "DAYS_DECISION": ["min", "max", "mean"],
+        "CNT_PAYMENT": ["mean", "sum"],
+    }
+    cat_aggregations = {column: ["mean"] for column in cat_cols}
+
+    prev_agg = prev.groupby("SK_ID_CURR").agg({**num_aggregations, **cat_aggregations})
+    prev_agg.columns = pd.Index(
+        [f"PREV_{column}_{agg.upper()}" for column, agg in prev_agg.columns.tolist()]
+    )
+    prev_agg = prev_agg.join(prev.groupby("SK_ID_CURR").size().rename("PREV_COUNT"))
+
+    # Historique approuvé
+    approved = prev.loc[prev.get("NAME_CONTRACT_STATUS_Approved", 0) == 1]
+    if not approved.empty:
+        approved_agg = approved.groupby("SK_ID_CURR").agg(num_aggregations)
+        approved_agg.columns = pd.Index(
+            [f"APPROVED_{column}_{agg.upper()}" for column, agg in approved_agg.columns.tolist()]
         )
-        cat_summary = cat_summary[
-            ["column_name", "n_uniques", "null", "%null", "modalite_top", "nb_modalite_top"]
-        ].sort_values(["%null", "n_uniques"], ascending=[False, False])
-        display(cat_summary.set_index("column_name"))
-    else:
-        print("\nAucune variable catégorielle.")
+        prev_agg = prev_agg.join(approved_agg, how="left", on="SK_ID_CURR")
+        prev_agg = prev_agg.join(approved.groupby("SK_ID_CURR").size().rename("APPROVED_COUNT"))
 
-    print(f"\n## 5) Variables temporelles ({len(dt_cols)})")
-    if dt_cols:
-        dt_queries = []
-        for col in dt_cols:
-            quoted_col = _quote_ident(col)
-            dt_queries.append(
-                f"""
-                SELECT
-                    '{col}' AS column_name,
-                    MIN({quoted_col}) AS min,
-                    MAX({quoted_col}) AS max,
-                    COUNT(*) FILTER (WHERE {quoted_col} IS NULL) AS null
-                FROM {table_ref}
-                """
-            )
-
-        dt_summary = pd.read_sql(_build_union_all(dt_queries), conn)
-        dt_summary["%null"] = np.where(
-            n_rows > 0,
-            (dt_summary["null"] / n_rows * 100).round(2),
-            0,
+    # Historique refusé
+    refused = prev.loc[prev.get("NAME_CONTRACT_STATUS_Refused", 0) == 1]
+    if not refused.empty:
+        refused_agg = refused.groupby("SK_ID_CURR").agg(num_aggregations)
+        refused_agg.columns = pd.Index(
+            [f"REFUSED_{column}_{agg.upper()}" for column, agg in refused_agg.columns.tolist()]
         )
-        display(dt_summary.set_index("column_name"))
-    else:
-        print("\nAucune variable datetime.")
+        prev_agg = prev_agg.join(refused_agg, how="left", on="SK_ID_CURR")
+        prev_agg = prev_agg.join(refused.groupby("SK_ID_CURR").size().rename("REFUSED_COUNT"))
+
+    del prev, approved, refused
+    gc.collect()
+    return prev_agg
+
+
+def pos_cash(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrège la table `POS_CASH_balance` à la maille client.
+
+    Cette table contient des informations de suivi sur les crédits POS / cash
+    et permet d'extraire notamment des indicateurs de retard.
+
+    Returns
+    -------
+    pd.DataFrame
+        Features agrégées par client.
+    """
+    pos = _read_csv_from_directory(data_dir, RAW_TABLES["pos_cash_balance"], num_rows=num_rows)
+    pos, cat_cols = one_hot_encode_dataframe(pos, nan_as_category=nan_as_category)
+
+    aggregations = {
+        "MONTHS_BALANCE": ["max", "mean", "size"],
+        "SK_DPD": ["max", "mean"],
+        "SK_DPD_DEF": ["max", "mean"],
+    }
+    for column in cat_cols:
+        aggregations[column] = ["mean"]
+
+    pos_agg = pos.groupby("SK_ID_CURR").agg(aggregations)
+    pos_agg.columns = pd.Index([f"POS_{column}_{agg.upper()}" for column, agg in pos_agg.columns.tolist()])
+    pos_agg = pos_agg.join(pos.groupby("SK_ID_CURR").size().rename("POS_COUNT"))
+
+    del pos
+    gc.collect()
+    return pos_agg
+
+
+def installments_payments(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrège la table `installments_payments` à la maille client.
+
+    Cette fonction calcule plusieurs indicateurs importants liés au paiement
+    des échéances :
+    - proportion payée,
+    - écart entre dû et payé,
+    - retard de paiement (DPD),
+    - paiement en avance (DBD).
+
+    Returns
+    -------
+    pd.DataFrame
+        Table agrégée par client.
+    """
+    installments = _read_csv_from_directory(data_dir, RAW_TABLES["installments_payments"], num_rows=num_rows)
+    installments, cat_cols = one_hot_encode_dataframe(installments, nan_as_category=nan_as_category)
+
+    # Pourcentage payé par rapport à la mensualité attendue
+    installments["PAYMENT_PERC"] = safe_divide(
+        installments["AMT_PAYMENT"],
+        installments["AMT_INSTALMENT"],
+    )
+
+    # Différence brute entre dû et payé
+    installments["PAYMENT_DIFF"] = installments["AMT_INSTALMENT"] - installments["AMT_PAYMENT"]
+
+    # Days Past Due : retard de paiement, borné à 0 si paiement à l'heure ou en avance
+    installments["DPD"] = (installments["DAYS_ENTRY_PAYMENT"] - installments["DAYS_INSTALMENT"]).clip(lower=0)
+
+    # Days Before Due : paiement en avance, borné à 0 si paiement en retard
+    installments["DBD"] = (installments["DAYS_INSTALMENT"] - installments["DAYS_ENTRY_PAYMENT"]).clip(lower=0)
+
+    aggregations = {
+        "NUM_INSTALMENT_VERSION": ["nunique"],
+        "DPD": ["max", "mean", "sum"],
+        "DBD": ["max", "mean", "sum"],
+        "PAYMENT_PERC": ["max", "mean", "sum", "var"],
+        "PAYMENT_DIFF": ["max", "mean", "sum", "var"],
+        "AMT_INSTALMENT": ["max", "mean", "sum"],
+        "AMT_PAYMENT": ["min", "max", "mean", "sum"],
+        "DAYS_ENTRY_PAYMENT": ["max", "mean", "sum"],
+    }
+    for column in cat_cols:
+        aggregations[column] = ["mean"]
+
+    installments_agg = installments.groupby("SK_ID_CURR").agg(aggregations)
+    installments_agg.columns = pd.Index(
+        [f"INSTAL_{column}_{agg.upper()}" for column, agg in installments_agg.columns.tolist()]
+    )
+    installments_agg = installments_agg.join(
+        installments.groupby("SK_ID_CURR").size().rename("INSTAL_COUNT")
+    )
+
+    del installments
+    gc.collect()
+    return installments_agg
+
+
+def credit_card_balance(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> pd.DataFrame:
+    """
+    Agrège la table `credit_card_balance` à la maille client.
+
+    Toutes les colonnes restantes (hors identifiant de demande précédente)
+    sont agrégées par client avec plusieurs statistiques descriptives.
+
+    Returns
+    -------
+    pd.DataFrame
+        Table agrégée par client.
+    """
+    credit_card = _read_csv_from_directory(data_dir, RAW_TABLES["credit_card_balance"], num_rows=num_rows)
+    credit_card, _ = one_hot_encode_dataframe(credit_card, nan_as_category=nan_as_category)
+
+    # On supprime l'identifiant de crédit précédent car on veut agréger au niveau client
+    credit_card = credit_card.drop(columns=["SK_ID_PREV"])
+
+    credit_card_agg = credit_card.groupby("SK_ID_CURR").agg(["min", "max", "mean", "sum", "var"])
+    credit_card_agg.columns = pd.Index(
+        [f"CC_{column}_{agg.upper()}" for column, agg in credit_card_agg.columns.tolist()]
+    )
+    credit_card_agg = credit_card_agg.join(credit_card.groupby("SK_ID_CURR").size().rename("CC_COUNT"))
+
+    del credit_card
+    gc.collect()
+    return credit_card_agg
+
+
+def add_post_join_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute des features dérivées après assemblage des différentes tables.
+
+    Ces ratios exploitent simultanément :
+    - des variables de la table principale,
+    - et des agrégations issues des tables historiques.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame final après jointure des tables enrichies.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copie enrichie avec de nouveaux ratios.
+    """
+    output = df.copy()
+
+    # Liste de features à créer sous la forme :
+    # (nom_nouvelle_feature, numerateur, denominateur)
+    feature_pairs = [
+        ("NEW_BUREAU_DEBT_RATIO", "BURO_AMT_CREDIT_SUM_DEBT_SUM", "BURO_AMT_CREDIT_SUM_SUM"),
+        ("NEW_ACTIVE_DEBT_RATIO", "ACTIVE_AMT_CREDIT_SUM_DEBT_SUM", "ACTIVE_AMT_CREDIT_SUM_SUM"),
+        ("NEW_APPROVAL_RATE", "APPROVED_COUNT", "PREV_COUNT"),
+        ("NEW_REFUSAL_RATE", "REFUSED_COUNT", "PREV_COUNT"),
+        ("NEW_LATE_PAYMENT_RATIO", "INSTAL_DPD_SUM", "INSTAL_COUNT"),
+        ("NEW_POS_DPD_RATIO", "POS_SK_DPD_DEF_MEAN", "POS_COUNT"),
+        ("NEW_CREDIT_TO_PREV_CREDIT_RATIO", "AMT_CREDIT", "PREV_AMT_CREDIT_MEAN"),
+        ("NEW_CURRENT_TO_APPROVED_CREDIT_RATIO", "AMT_CREDIT", "APPROVED_AMT_CREDIT_MEAN"),
+        ("NEW_CURRENT_TO_INCOME_CREDIT_RATIO", "AMT_CREDIT", "AMT_INCOME_TOTAL"),
+    ]
+
+    # On ne calcule la feature que si les deux colonnes existent
+    for new_feature, numerator_feature, denominator_feature in feature_pairs:
+        if numerator_feature in output.columns and denominator_feature in output.columns:
+            output[new_feature] = safe_divide(output[numerator_feature], output[denominator_feature])
+
+    return output
+
+
+def build_full_dataset(
+    data_dir: Path | str,
+    num_rows: int | None = None,
+    nan_as_category: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Construit le dataset final train/test enrichi à partir de toutes les tables Home Credit.
+
+    Pipeline global :
+    1. préparation de la table principale application,
+    2. création des agrégats issus des tables secondaires,
+    3. suppression des colonnes peu informatives,
+    4. jointure de toutes les tables à la maille client,
+    5. création de features post-jointure,
+    6. séparation finale en train / test,
+    7. production d'un rapport de jointure.
+
+    Parameters
+    ----------
+    data_dir : Path | str
+        Répertoire contenant les tables brutes.
+    num_rows : int | None, optional
+        Nombre maximum de lignes à charger par table.
+    nan_as_category : bool, optional
+        Indique si les NaN doivent être traités comme une catégorie lors du one-hot encoding.
+
+    Returns
+    -------
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
+        - train_df : dataset d'entraînement enrichi
+        - test_df : dataset de test enrichi
+        - join_report : rapport synthétique des jointures effectuées
+    """
+    data_path = Path(data_dir)
+
+    # Construction des différentes briques de features
+    base = application_train_test(
+        data_dir=data_path,
+        num_rows=num_rows,
+        nan_as_category=nan_as_category,
+    )
+    bureau = bureau_and_balance(data_dir=data_path, num_rows=num_rows, nan_as_category=nan_as_category)
+    prev = previous_applications(data_dir=data_path, num_rows=num_rows, nan_as_category=nan_as_category)
+    pos = pos_cash(data_dir=data_path, num_rows=num_rows, nan_as_category=nan_as_category)
+    installments = installments_payments(data_dir=data_path, num_rows=num_rows, nan_as_category=nan_as_category)
+    credit_card = credit_card_balance(data_dir=data_path, num_rows=num_rows, nan_as_category=nan_as_category)
+
+    # Suppression des colonnes peu informatives avant les jointures
+    base, _ = drop_low_information_columns(
+        base,
+        protected_columns=["SK_ID_CURR", "TARGET"],
+    )
+    bureau, _ = drop_low_information_columns(bureau)
+    prev, _ = drop_low_information_columns(prev)
+    pos, _ = drop_low_information_columns(pos)
+    installments, _ = drop_low_information_columns(installments)
+    credit_card, _ = drop_low_information_columns(credit_card)
+
+    # Historique des jointures, utile pour audit/debug
+    join_steps: list[dict[str, int]] = []
+
+    # Point de départ : table principale
+    full_df = base.copy()
+
+    # Jointure successive de chaque bloc de features sur la clé client
+    for table_name, features_df in [
+        ("bureau", bureau),
+        ("previous_application", prev),
+        ("pos_cash_balance", pos),
+        ("installments_payments", installments),
+        ("credit_card_balance", credit_card),
+    ]:
+        before_rows = len(full_df)
+
+        # Join left : on conserve tous les clients de la table de base
+        full_df = full_df.join(features_df, how="left", on="SK_ID_CURR")
+
+        join_steps.append(
+            {
+                "table_name": table_name,
+                "rows_before_join": before_rows,
+                "rows_after_join": len(full_df),
+                "added_columns": int(features_df.shape[1]),
+            }
+        )
+
+    # Création de features supplémentaires après assemblage
+    full_df = add_post_join_features(full_df)
+
+    # Séparation train / test via la présence ou non de TARGET
+    train_df = full_df.loc[full_df["TARGET"].notna()].copy()
+    test_df = full_df.loc[full_df["TARGET"].isna()].drop(columns=["TARGET"]).copy()
+
+    # Sécurisation du type de la target
+    train_df["TARGET"] = train_df["TARGET"].astype(int)
+
+    # Rapport de jointure
+    join_report = pd.DataFrame(join_steps)
+
+    # Libération mémoire
+    del base, bureau, prev, pos, installments, credit_card, full_df
+    gc.collect()
+
+    return train_df, test_df, join_report

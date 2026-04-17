@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv/
+.env
 
 # Local raw datasets too large for GitHub
 data/raw/POS_CASH_balance.csv
@@ -20,3 +21,11 @@ data/raw/previous_application.csv
 
 # Generated processed datasets
 data/processed/
+mlruns/
+mlartifacts/
+mlflow.db
+mlflow.db-journal
+
+# Local pedagogical material not meant for versioning
+projet P4/
+notebooks_exemple/

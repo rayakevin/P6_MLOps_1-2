@@ -1,20 +1,22 @@
 [project]
-name = "projet-4"
+name = "p6-mlops-1-2"
 version = "0.1.0"
-description = "Add your description here"
+description = "Pedagogical MLOps pipeline for Home Credit default-risk modeling with MLflow"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "category-encoders>=2.9.0",
     "imblearn>=0.0",
+    "ipykernel>=6.29.5",
+    "ipywidgets>=8.1.5",
     "joblib>=1.5.3",
+    "jupyterlab>=4.3.5",
+    "lightgbm>=4.6.0",
     "matplotlib>=3.10.8",
-    "mlflow>=1.27.0",
+    "mlflow>=3.0.0",
+    "missingno>=0.5.2",
     "numpy>=2.4.2",
-    "pandas>=3.0.1",
-    "psycopg2>=2.9.11",
-    "psycopg2-binary>=2.9.11",
-    "python-dotenv>=1.2.2",
+    "pandas>=2.2,<3",
     "scikit-learn>=1.8.0",
     "scipy>=1.17.1",
     "seaborn>=0.13.2",
